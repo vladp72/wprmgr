@@ -1,0 +1,10 @@
+#ifndef _AC_HELPERS_WIN32_LIBRARY_TEST_CANCELATION_GROUP_TP_HEADER_
+#define _AC_HELPERS_WIN32_LIBRARY_TEST_CANCELATION_GROUP_TP_HEADER_
+
+void test_default_thread_pool_cancelation_group();
+void test_thread_pool_cancelation_group();
+
+void stresstest_default_thread_pool_cancelation_group();
+void stresstest_thread_pool_cancelation_group();
+
+#endif _AC_HELPERS_WIN32_LIBRARY_TEST_CANCELATION_GROUP_TP_HEADER_
