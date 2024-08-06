@@ -6,6 +6,7 @@
 
 #include "accommon.h"
 #include "acresourceowner.h"
+#include "acrundown.h"
 
 namespace ac::tp {
 
@@ -43,7 +44,8 @@ namespace ac::tp {
         return (std::chrono::duration<double, std::ratio<1, 10000000>>(_Val));
     }
 
-    class cleanup_group;
+    typedef std::shared_ptr<slim_rundown> slim_rundown_ptr;
+
     class thread_pool;
     class callback_instance;
     class work_item_base;
@@ -51,10 +53,8 @@ namespace ac::tp {
     class timer_work_item;
     class wait_work_item;
     class io_handler;
-    class safe_cleanup_group;
 
     typedef std::shared_ptr<thread_pool> thread_pool_ptr;
-    typedef std::shared_ptr<cleanup_group> cleanup_group_ptr;
     typedef std::shared_ptr<work_item_base> work_item_base_ptr;
     typedef std::shared_ptr<work_item> work_item_ptr;
     typedef std::shared_ptr<timer_work_item> timer_work_item_ptr;
@@ -244,75 +244,19 @@ namespace ac::tp {
         profiling_time_point completed_time_{};
     };
 
-    //
-    // All work items are inherited from this base that contains some common facilities
-    // like state machine, helper functions and a common interface declaration (join).
-    //
-    // This state machine is an unfortunate complication that we have to do to work around issue
-    // with work item cancelation. The issue is that WaitForThreadPool* methods
-    // tells us if work item was canceled or executed so we need to do our own tracking.
-    // There are two possible scenarios:
-    // - Someone creates a work item and does not hold a reference to the work item so
-    // we have t do AddRef while work item is in the waiting state to make sure it stays
-    // alive. Once work item was executed it will call move_to_completed and will release
-    // reference if no one has done this yet. If work item belongs to a cancelation group
-    // then calling cancelation_group::cancel will either cancel the work item before it was
-    // executed and will move it to the closed state (in this case we will release reference
-    // we've added when we've moved the work item to the waiting state) or wait for the work
-    // item to complete execution. !!! Would it close the TPT_* structure in this case?
-    // if yes then there might be a bug because according to MSDN cancel method of the
-    // cancelation group is called only for work items that were canceled before execution
-    // so no one will mark the other work items as closed !!!!
-    // - Someone creates a work item and holds a reference to it planning to eventually call
-    // join. This scenario similar to the one above except that now race conditions became
-    // even more complicated because of the join. First of all it is responsibility of the
-    // caller to make sure join and cancelation_group::cleanup do not race with each other.
-    // Once join completes it calls move_to_ready and releases reference if the work item is still
-    // in waiting state, which could happens only if work item was canceled before it ran.
-    //
-    // All this would be MUCH simpler if Wait* would tell us if work item actually ran or not.
-    //
-    class cleanup_group_member_itf {
-    public:
-        virtual ~cleanup_group_member_itf() noexcept {
-        }
-
-        virtual void on_closed() noexcept = 0;
-    };
-
     class work_item_base
-        : public cleanup_group_member_itf
-        , public std::enable_shared_from_this<work_item_base>
+        : public std::enable_shared_from_this<work_item_base>
         , public work_item_profiling {
     public:
-        virtual void join() noexcept = 0;
-        virtual void try_cancel_and_join() noexcept = 0;
-
-        [[nodiscard]] bool is_closed() const noexcept {
-            return state_ == closed;
-        }
-
-        [[nodiscard]] operator bool() const noexcept {
-            return !is_closed();
-        }
 
     private:
         typedef enum {
-            closed    = 0x01,
-            ready     = 0x02,
-            posted    = 0x04,
+            ready     = 0x00,
+            posted    = 0x01,
         } state_t;
 
         state_t atomic_set_state(state_t new_state) noexcept {
             return state_.exchange(new_state);
-        }
-
-        state_t atomic_set_state_if_not_closed(state_t new_state) noexcept {
-            state_t state{state_.load()};
-            while (state != closed &&
-                   !state_.compare_exchange_strong(state, new_state)) {
-            }
-            return state;
         }
 
 
@@ -330,26 +274,19 @@ namespace ac::tp {
         }
 
         void move_to_posted() noexcept {
-            state_t old_state = atomic_set_state(posted);
-            AC_CODDING_ERROR_IF_NOT(old_state == ready);
+            state_t prev_state = atomic_set_state(posted);
+            AC_CODDING_ERROR_IF_NOT(prev_state == ready);
             AC_CODDING_ERROR_IF_NOT(nullptr == self_);
             self_ = shared_from_this();
             update_scheduled_time();
         }
 
         work_item_base_ptr move_to_ready() noexcept {
-            state_t old_state = atomic_set_state_if_not_closed(ready);
-            if (old_state == posted || old_state == closed) {
+            state_t prev_state = atomic_set_state(ready);
+            if (prev_state == posted) {
                 return std::move(self_);
             }
             return work_item_base_ptr();
-        }
-
-        void move_to_closed() noexcept {
-            state_t old_state = atomic_set_state(closed);
-            if (old_state == posted) {
-                self_ = work_item_base_ptr();
-            }
         }
 
         void join_complete() {
@@ -396,6 +333,10 @@ namespace ac::tp {
         // Tracks current state of the call-back
         //
         std::atomic<state_t> state_{ready};
+        //
+        //
+        //
+        slim_rundown_ptr rundown_;
         //
         // While WI is in waiting state we keep a strong
         // reference to ourself
@@ -483,9 +424,7 @@ namespace ac::tp {
     public:
         template<typename C>
         explicit work_item(C &&callback, callback_environment *environment = nullptr)
-            : callback_(std::forward<C>(callback))
-            , work_(nullptr)
-            , callback_thread_id_(0) {
+            : callback_(std::forward<C>(callback)) {
             work_ = CreateThreadpoolWork(&work_item::run_callback,
                                          this,
                                          environment ? environment->get_handle() : nullptr);
@@ -496,9 +435,7 @@ namespace ac::tp {
         }
 
         ~work_item() noexcept {
-            if (!is_closed()) {
-                CloseThreadpoolWork(work_);
-            }
+            CloseThreadpoolWork(work_);
         }
 
         template<typename C>
@@ -520,32 +457,24 @@ namespace ac::tp {
             SubmitThreadpoolWork(work_);
         }
 
-        void join() noexcept override {
+        void join() noexcept {
             //
             // If we ever try to do join from the thread that
             // is running a call back then we will deadlock
             //
             AC_CODDING_ERROR_IF(is_current_thread_executing_callback());
-
-            if (!is_closed()) {
-                WaitForThreadpoolWorkCallbacks(work_, FALSE);
-
-                join_complete();
-            }
+            WaitForThreadpoolWorkCallbacks(work_, FALSE);
+            join_complete();
         }
 
-        void try_cancel_and_join() noexcept override {
+        void try_cancel_and_join() noexcept {
             //
             // If we ever try to do join from the thread that
             // is running a call back then we will deadlock
             //
             AC_CODDING_ERROR_IF(is_current_thread_executing_callback());
-
-            if (!is_closed()) {
-                WaitForThreadpoolWorkCallbacks(work_, TRUE);
-
-                join_complete();
-            }
+            WaitForThreadpoolWorkCallbacks(work_, TRUE);
+            join_complete();
         }
 
         [[nodiscard]] bool is_current_thread_executing_callback() const noexcept {
@@ -557,9 +486,6 @@ namespace ac::tp {
         }
 
     private:
-        void on_closed() noexcept override {
-            move_to_closed();
-        }
 
         static void CALLBACK run_callback(PTP_CALLBACK_INSTANCE instance,
                                           void *context,
@@ -595,7 +521,7 @@ namespace ac::tp {
         // Pointer to the thread pool descriptor
         // of the work item
         //
-        PTP_WORK work_;
+        PTP_WORK work_{nullptr};
         //
         // When the call back is called it sets this
         // variable to the address of the current
@@ -605,7 +531,7 @@ namespace ac::tp {
         // this filed to assert in the cases where we
         // do call wait from inside the wait.
         //
-        DWORD callback_thread_id_;
+        DWORD callback_thread_id_{0};
     };
 
     //
@@ -621,9 +547,7 @@ namespace ac::tp {
     public:
         template<typename C>
         explicit timer_work_item(C &&callback, callback_environment *environment = nullptr)
-            : callback_(std::forward<C>(callback))
-            , timer_(nullptr)
-            , callback_thread_id_(0) {
+            : callback_(std::forward<C>(callback)) {
             timer_ = CreateThreadpoolTimer(&timer_work_item::run_callback,
                                            this,
                                            environment ? environment->get_handle() : nullptr);
@@ -634,9 +558,7 @@ namespace ac::tp {
         }
 
         ~timer_work_item() noexcept {
-            if (!is_closed()) {
-                CloseThreadpoolTimer(timer_);
-            }
+            CloseThreadpoolTimer(timer_);
         }
 
         template<typename C>
@@ -687,34 +609,25 @@ namespace ac::tp {
             SetThreadpoolTimer(timer_, &ft_due_time, 0, window_length);
         }
 
-        void join() noexcept override {
-            if (!is_closed()) {
-                //
-                // If we ever try to do join from the thread that
-                // is running a call back then we will deadlock
-                //
-                AC_CODDING_ERROR_IF(is_current_thread_executing_callback());
-
-                WaitForThreadpoolTimerCallbacks(timer_, FALSE);
-
-                join_complete();
-            }
+        void join() noexcept {
+            //
+            // If we ever try to do join from the thread that
+            // is running a call back then we will deadlock
+            //
+            AC_CODDING_ERROR_IF(is_current_thread_executing_callback());
+            WaitForThreadpoolTimerCallbacks(timer_, FALSE);
+            join_complete();
         }
 
-        void try_cancel_and_join() noexcept override {
-            if (!is_closed()) {
-                //
-                // If we ever try to do join from the thread that
-                // is running a call back then we will deadlock
-                //
-                AC_CODDING_ERROR_IF(is_current_thread_executing_callback());
-
-                SetThreadpoolTimer(timer_, nullptr, 0, 0);
-
-                WaitForThreadpoolTimerCallbacks(timer_, TRUE);
-
-                join_complete();
-            }
+        void try_cancel_and_join() noexcept {
+            //
+            // If we ever try to do join from the thread that
+            // is running a call back then we will deadlock
+            //
+            AC_CODDING_ERROR_IF(is_current_thread_executing_callback());
+            SetThreadpoolTimer(timer_, nullptr, 0, 0);
+            WaitForThreadpoolTimerCallbacks(timer_, TRUE);
+            join_complete();
         }
 
         [[nodiscard]] bool is_current_thread_executing_callback() const {
@@ -726,9 +639,6 @@ namespace ac::tp {
         }
 
     private:
-        void on_closed() noexcept override {
-            move_to_closed();
-        }
 
         static void CALLBACK run_callback(PTP_CALLBACK_INSTANCE instance,
                                           void *context,
@@ -763,7 +673,7 @@ namespace ac::tp {
         // Pointer to the thread pool descriptor
         // of the timer work item
         //
-        PTP_TIMER timer_;
+        PTP_TIMER timer_{nullptr};
         //
         // When the call back is called it sets this
         // variable to the address of the current
@@ -773,7 +683,7 @@ namespace ac::tp {
         // this filed to assert in the cases where we
         // do call wait from inside the wait.
         //
-        DWORD callback_thread_id_;
+        DWORD callback_thread_id_{0};
     };
 
     //
@@ -788,9 +698,7 @@ namespace ac::tp {
     public:
         template<typename C>
         explicit wait_work_item(C &&callback, callback_environment *environment = nullptr)
-            : callback_(std::forward<C>(callback))
-            , wait_(nullptr)
-            , callback_thread_id_(0) {
+            : callback_(std::forward<C>(callback)) {
             wait_ = CreateThreadpoolWait(&wait_work_item::run_callback,
                                          this,
                                          environment ? environment->get_handle() : nullptr);
@@ -801,9 +709,7 @@ namespace ac::tp {
         }
 
         ~wait_work_item() noexcept {
-            if (!is_closed()) {
-                CloseThreadpoolWait(wait_);
-            }
+            CloseThreadpoolWait(wait_);
         }
 
         template<typename C>
@@ -845,34 +751,25 @@ namespace ac::tp {
             SetThreadpoolWait(wait_, handle, &ft_due_time);
         }
 
-        void join() noexcept override {
-            if (!is_closed()) {
-                //
-                // If we ever try to do join from the thread that
-                // is running a call back then we will deadlock
-                //
-                AC_CODDING_ERROR_IF(is_current_thread_executing_callback());
-
-                WaitForThreadpoolWaitCallbacks(wait_, FALSE);
-
-                join_complete();
-            }
+        void join() noexcept {
+            //
+            // If we ever try to do join from the thread that
+            // is running a call back then we will deadlock
+            //
+            AC_CODDING_ERROR_IF(is_current_thread_executing_callback());
+            WaitForThreadpoolWaitCallbacks(wait_, FALSE);
+            join_complete();
         }
 
-        void try_cancel_and_join() noexcept override {
-            if (!is_closed()) {
-                //
-                // If we ever try to do join from the thread that
-                // is running a call back then we will deadlock
-                //
-                AC_CODDING_ERROR_IF(is_current_thread_executing_callback());
-
-                SetThreadpoolWait(wait_, nullptr, nullptr);
-
-                WaitForThreadpoolWaitCallbacks(wait_, TRUE);
-
-                join_complete();
-            }
+        void try_cancel_and_join() noexcept {
+            //
+            // If we ever try to do join from the thread that
+            // is running a call back then we will deadlock
+            //
+            AC_CODDING_ERROR_IF(is_current_thread_executing_callback());
+            SetThreadpoolWait(wait_, nullptr, nullptr);
+            WaitForThreadpoolWaitCallbacks(wait_, TRUE);
+            join_complete();
         }
 
         bool is_current_thread_executing_callback() const {
@@ -884,9 +781,6 @@ namespace ac::tp {
         }
 
     private:
-        void on_closed() noexcept override {
-            move_to_closed();
-        }
 
         static void CALLBACK run_callback(PTP_CALLBACK_INSTANCE instance,
                                           void *context,
@@ -922,7 +816,7 @@ namespace ac::tp {
         // Pointer to the thread pool descriptor
         // of the timer work item
         //
-        PTP_WAIT wait_;
+        PTP_WAIT wait_{nullptr};
         //
         // When the call back is called it sets this
         // variable to the address of the current
@@ -932,7 +826,7 @@ namespace ac::tp {
         // this filed to assert in the cases where we
         // do call wait from inside the wait.
         //
-        DWORD callback_thread_id_;
+        DWORD callback_thread_id_{0};
     };
 
     class io_guard final {
@@ -987,7 +881,7 @@ namespace ac::tp {
     // that all ongoing IO is completed before going and destroying this
     // class.
     //
-    class io_handler final: public cleanup_group_member_itf {
+    class io_handler final {
         friend class io_guard;
 
     public:
@@ -1076,18 +970,10 @@ namespace ac::tp {
             return state_.exchange(new_state);
         }
 
-        void move_to_closed() noexcept {
-            state_t old_state = atomic_set_state(closed);
-        }
-
         void internal_start_io() noexcept {
             AC_CODDING_ERROR_IF(is_closed());
 
             StartThreadpoolIo(io_);
-        }
-
-        void on_closed() noexcept override {
-            move_to_closed();
         }
 
         static void CALLBACK run_callback(PTP_CALLBACK_INSTANCE instance,
@@ -1188,8 +1074,6 @@ namespace ac::tp {
                                                   PTP_POOL_STACK_INFORMATION stack_information = nullptr) {
             return std::make_shared<thread_pool>(max_threads, min_threads, stack_information);
         }
-
-        [[nodiscard]] cleanup_group_ptr make_cleanup_group();
 
         template<typename C>
         [[nodiscard]] work_item_ptr make_work_item(
@@ -1329,563 +1213,11 @@ namespace ac::tp {
         PTP_POOL pool_;
     };
 
-    //
-    // This class is a wrapper around thread pool cleanup group
-    //
-    // Calling *join on the group calls cleanup_group::on_closed for every TP_*
-    // object associated with this cancelation group. For more details see
-    // cleanup_group::on_closed calls virtual function <object>::on_closed on the RAII wrapper
-    // that owns object. The <object>::on_closed drops reference on itself that it is holding while
-    // object is posted or running, and moves itself to closed state. Object destructor checks if
-    // object was moved to closed state then it knows that TP_* object is already destroyed.
-    // After object is moved to closed state it must not be used.
-    // https://learn.microsoft.com/en-us/windows/win32/api/threadpoolapiset/nf-threadpoolapiset-closethreadpoolcleanupgroupmembers
-    // App must be careful to serialize associating new objects with thread pool and calling *join.
-    //
-    // Consider using safe_cleanup_group instead of cleanup_group. It prevents
-    // race described in the above article by destroying cleanup group that is being joined.
-    // Attempts to create new objects on joined cleanup group will fail.
-    // Caller is responsible to call reinitialize to create a new cleanup group, only after
-    // that he will be able to create new objects.
-    //
-    class cleanup_group final: public std::enable_shared_from_this<cleanup_group> {
-    public:
-        [[nodiscard]] static cleanup_group_ptr make(thread_pool_ptr thread_pool = thread_pool_ptr{}) {
-            return std::make_shared<cleanup_group>(std::move(thread_pool));
-        }
-
-        explicit cleanup_group(thread_pool_ptr const &thread_pool = thread_pool_ptr{})
-            : group_(nullptr) {
-            create(thread_pool);
-        }
-
-        cleanup_group(cleanup_group &) = delete;
-        cleanup_group(cleanup_group &&) = delete;
-        cleanup_group &operator=(cleanup_group &) = delete;
-        cleanup_group &operator=(cleanup_group &&) = delete;
-
-        ~cleanup_group() noexcept {
-            try_cancel_and_join();
-
-            CloseThreadpoolCleanupGroup(group_);
-        }
-
-        void join() noexcept {
-            //
-            // Passing FALSE as a second parameter does not work as expected
-            // For instance it will not wait for timers and waits to get completed
-            // but instead just cancels them so there is no "true" join
-            //
-            CloseThreadpoolCleanupGroupMembers(group_, FALSE, this);
-        }
-
-        void try_cancel_and_join() noexcept {
-            //
-            // Passing FALSE as a second parameter does not work as expected
-            // For instance it will not wait for timers and waits to get completed
-            // but instead just cancels them so there is no "true" join
-            //
-            CloseThreadpoolCleanupGroupMembers(group_, TRUE, this);
-        }
-
-        template<typename C>
-        [[nodiscard]] work_item_ptr make_work_item(
-            C &&callback, optional_callback_parameters const *params = nullptr) {
-            callback_environment environment;
-            environment.set_cleanup_group(group_, &cleanup_group::on_closed_callback);
-            if (thread_pool_) {
-                environment.set_thread_pool(thread_pool_->get_handle());
-            }
-            environment.set_callback_optional_parameters(params);
-
-            return work_item::make(std::forward<C>(callback), &environment);
-        }
-
-        template<typename C>
-        [[nodiscard]] timer_work_item_ptr make_timer_work_item(
-            C &&callback, optional_callback_parameters const *params = nullptr) {
-            callback_environment environment;
-            environment.set_cleanup_group(group_, &cleanup_group::on_closed_callback);
-            if (thread_pool_) {
-                environment.set_thread_pool(thread_pool_->get_handle());
-            }
-            environment.set_callback_optional_parameters(params);
-
-            return timer_work_item::make(std::forward<C>(callback), &environment);
-        }
-
-        template<typename C>
-        [[nodiscard]] wait_work_item_ptr make_wait_work_item(
-            C &&callback, optional_callback_parameters const *params = nullptr) {
-            callback_environment environment;
-            environment.set_cleanup_group(group_, &cleanup_group::on_closed_callback);
-            if (thread_pool_) {
-                environment.set_thread_pool(thread_pool_->get_handle());
-            }
-            environment.set_callback_optional_parameters(params);
-
-            return wait_work_item::make(std::forward<C>(callback), &environment);
-        }
-
-        template<typename C>
-        [[nodiscard]] io_handler_ptr make_io_handler(
-            HANDLE handle, C &&callback, optional_callback_parameters const *params = nullptr) {
-            callback_environment environment;
-            environment.set_cleanup_group(group_, &cleanup_group::on_closed_callback);
-            if (thread_pool_) {
-                environment.set_thread_pool(thread_pool_->get_handle());
-            }
-            environment.set_callback_optional_parameters(params);
-
-            return io_handler::make(handle, std::forward<C>(callback), &environment);
-        }
-
-        template<typename C>
-        inline void submit_work(C &&callback) {
-            std::unique_ptr<C> cb{new C{std::forward<C>(callback)}};
-            if (TrySubmitThreadpoolCallback(
-                    &details::submit_work_worker<C>, cb.get(), nullptr)) {
-                cb.release();
-            } else {
-                AC_THROW(GetLastError(), "TrySubmitThreadpoolCallback");
-            }
-            return;
-        }
-
-        template<typename C>
-        inline void submit_work(C &&callback, optional_callback_parameters const *params) {
-            std::unique_ptr<C> cb{new C{std::forward<C>(callback)}};
-            callback_environment environment;
-            environment.set_cleanup_group(group_, &cleanup_group::on_closed_callback);
-            if (thread_pool_) {
-                environment.set_thread_pool(thread_pool_->get_handle());
-            }
-            environment.set_callback_optional_parameters(params);
-            if (TrySubmitThreadpoolCallback(
-                    &details::submit_work_worker<C>, cb.get(), environment.get_handle())) {
-                cb.release();
-            } else {
-                AC_THROW(GetLastError(), "TrySubmitThreadpoolCallback");
-            }
-            return;
-        }
-
-        template<typename C>
-        work_item_ptr post(C &&callback, optional_callback_parameters const *params = nullptr) {
-            work_item_ptr work_item{make_work_item(std::forward<C>(callback), params)};
-            work_item->post();
-            return work_item;
-        }
-
-        template<typename C>
-        timer_work_item_ptr schedule(C &&callback,
-                                     time_point const &due_time,
-                                     DWORD window_length = 0,
-                                     optional_callback_parameters const *params = nullptr) {
-            timer_work_item_ptr timer_work_item{
-                make_timer_work_item(std::forward<C>(callback), params)};
-            timer_work_item->schedule(due_time, window_length);
-            return timer_work_item;
-        }
-
-        template<typename C>
-        timer_work_item_ptr schedule(C &&callback,
-                                     duration const &due_time,
-                                     DWORD window_length = 0,
-                                     optional_callback_parameters const *params = nullptr) {
-            timer_work_item_ptr timer_work_item{
-                make_timer_work_item(std::forward<C>(callback), params)};
-            timer_work_item->schedule(due_time, window_length);
-            return timer_work_item;
-        }
-
-        template<typename C>
-        wait_work_item_ptr schedule_wait(C &&callback,
-                                         HANDLE handle,
-                                         duration const &due_time = infinite_duration,
-                                         optional_callback_parameters const *params = nullptr) {
-            wait_work_item_ptr wait_work_item{
-                make_wait_work_item(std::forward<C>(callback), params)};
-            wait_work_item->schedule_wait(handle, due_time);
-            return wait_work_item;
-        }
-
-        template<typename C>
-        wait_work_item_ptr schedule_wait(C &&callback,
-                                         HANDLE handle,
-                                         time_point const &due_time,
-                                         optional_callback_parameters const *params = nullptr) {
-            wait_work_item_ptr wait_work_item{
-                make_timer_work_item(std::forward<C>(callback), params)};
-            wait_work_item->schedule(handle, due_time);
-            return wait_work_item;
-        }
-
-    private:
-        [[nodiscard]] PTP_CLEANUP_GROUP get_handle() noexcept {
-            return group_;
-        }
-
-        void create(thread_pool_ptr thread_pool) {
-            group_ = CreateThreadpoolCleanupGroup();
-
-            if (nullptr == group_) {
-                AC_THROW(GetLastError(), "CreateThreadpoolCleanupGroup");
-            }
-
-            if (nullptr != thread_pool) {
-                thread_pool_ = std::move(thread_pool);
-            }
-        }
-
-        void on_closed(void *object_context) noexcept {
-            cleanup_group_member_itf *member =
-                static_cast<cleanup_group_member_itf *>(object_context);
-            member->on_closed();
-        }
-
-        static void NTAPI on_closed_callback(void *object_context, void *cleanup_context) noexcept {
-            cleanup_group *self = static_cast<cleanup_group *>(cleanup_context);
-            self->on_closed(object_context);
-        }
-
-        PTP_CLEANUP_GROUP group_;
-        callback_environment environment_;
-        //
-        // if cleanup group was associated with a thread pool then keep it alive
-        // until cleanup group is destroyed.
-        //
-        thread_pool_ptr thread_pool_;
-    };
-
-    //
-    // cleanup_group will wait for ongoing work to complete, but it does not prevent
-    // new work from getting started.
-    // safe_cleanup_group solves this by tracking if rundown has already started,
-    // and preventing new work from getting scheduled until cleanup_group is
-    // reinitialized again.
-    // When reinitialize called on already initialized object it will implicitly
-    // try_cancel_and_join, but only after new group was created so you might see new work
-    // items start using new group while old work is still running down. To avoid that
-    // call join explicitly before calling reinitialize.
-    // All post and schedule methods have Try prefix pointing out that they might fail
-    // when rundown started. Check result for nullptr to see if post succeeded or failed.
-    //
-    class safe_cleanup_group final {
-    public:
-        safe_cleanup_group()
-            : group_(nullptr) {
-            reinitialize(thread_pool_ptr{});
-        }
-
-        explicit safe_cleanup_group(thread_pool_ptr thread_pool)
-            : group_(nullptr) {
-            reinitialize(std::move(thread_pool));
-        }
-
-        safe_cleanup_group(safe_cleanup_group &) = delete;
-        safe_cleanup_group(safe_cleanup_group &&) = delete;
-        safe_cleanup_group &operator=(safe_cleanup_group &) = delete;
-        safe_cleanup_group &operator=(safe_cleanup_group &&) = delete;
-
-        ~safe_cleanup_group() noexcept {
-            try_cancel_and_join();
-        }
-
-        void reinitialize(thread_pool_ptr thread_pool = thread_pool_ptr{}) {
-            cleanup_group_ptr group;
-            {
-                auto grab{acquire_resource_exclusive(lock_)};
-                group = std::move(group_);
-                group_ = cleanup_group::make(std::move(thread_pool));
-            }
-        }
-
-        [[nodiscard]] bool is_valid() const noexcept {
-            auto grab{acquire_resource_shared(lock_)};
-            return nullptr != group_;
-        }
-
-        [[nodiscard]] explicit operator bool() const noexcept {
-            return is_valid();
-        }
-
-        [[nodiscard]] cleanup_group_ptr try_get_cleanup_group() noexcept {
-            auto grab{acquire_resource_shared(lock_)};
-            return group_;
-        }
-
-        void join() noexcept {
-            cleanup_group_ptr group;
-            {
-                auto grab{acquire_resource_exclusive(lock_)};
-                group = std::move(group_);
-            }
-            if (group != nullptr) {
-                group->join();
-            }
-        }
-
-        void try_cancel_and_join() noexcept {
-            cleanup_group_ptr group;
-            {
-                auto grab{acquire_resource_exclusive(lock_)};
-                group = std::move(group_);
-            }
-            if (group != nullptr) {
-                group->try_cancel_and_join();
-            }
-        }
-
-        template<typename C>
-        [[nodiscard]] work_item_ptr try_make_work_item(
-            C &&callback, optional_callback_parameters const *params = nullptr) {
-            work_item_ptr work_item;
-            {
-                auto grab{ac::acquire_resource_shared(lock_)};
-                if (group_) {
-                    work_item = group_->make_work_item(std::forward<C>(callback), params);
-                }
-            }
-            return work_item;
-        }
-
-        template<typename C>
-        [[nodiscard]] timer_work_item_ptr try_make_timer_work_item(
-            C &&callback, optional_callback_parameters const *params = nullptr) {
-            timer_work_item_ptr timer_work_item;
-            {
-                auto grab{ac::acquire_resource_shared(lock_)};
-                if (group_) {
-                    timer_work_item = group_->make_timer_work_item(
-                        std::forward<C>(callback), params);
-                }
-            }
-            return timer_work_item;
-        }
-
-        template<typename C>
-        [[nodiscard]] wait_work_item_ptr try_make_wait_work_item(
-            C &&callback, optional_callback_parameters const *params = nullptr) {
-            wait_work_item_ptr wait_work_item;
-            {
-                auto grab{ac::acquire_resource_shared(lock_)};
-                if (group_) {
-                    wait_work_item = group_->make_wait_work_item(
-                        std::forward<C>(callback), params);
-                }
-            }
-            return wait_work_item;
-        }
-
-        template<typename C>
-        [[nodiscard]] io_handler_ptr try_make_io_handler(
-            HANDLE handle, C &&callback, optional_callback_parameters const *params = nullptr) {
-            io_handler_ptr io_handler;
-            {
-                auto grab{ac::acquire_resource_shared(lock_)};
-                if (group_) {
-                    io_handler = group_->make_io_handler(
-                        handle, std::forward<C>(callback), params);
-                }
-            }
-            return io_handler;
-        }
-
-        template<typename C>
-        [[nodiscard]] work_item_ptr try_post(C &&callback,
-                                             optional_callback_parameters const *params = nullptr) {
-            work_item_ptr work_item;
-            auto grab{ac::acquire_resource_shared(lock_)};
-            if (group_) {
-                work_item = group_->post(std::forward<C>(callback));
-            }
-            return work_item;
-        }
-
-        template<typename C>
-        [[nodiscard]] bool try_post(work_item_ptr &work_item) {
-            auto grab{ac::acquire_resource_shared(lock_)};
-            if (group_) {
-                work_item->post();
-                return true;
-            }
-            return false;
-        }
-
-        template<typename C>
-        inline [[nodiscard]] bool try_submit_work(C &&callback) {
-            auto grab{ac::acquire_resource_shared(lock_)};
-            if (group_) {
-                group_->submit_work(std::forward<C>(callback));
-                return true;
-            }
-            return false;
-        }
-
-        template<typename C>
-        inline [[nodiscard]] bool try_submit_work(C &&callback,
-                                                  optional_callback_parameters const *params) {
-            auto grab{ac::acquire_resource_shared(lock_)};
-            if (group_) {
-                group_->submit_work(std::forward<C>(callback), params);
-                return true;
-            }
-            return false;
-        }
-
-        template<typename C>
-        [[nodiscard]] timer_work_item_ptr try_schedule(C &&callback,
-                                                       time_point const &due_time,
-                                                       DWORD window_length = 0,
-                                                       optional_callback_parameters const *params = nullptr) {
-            timer_work_item_ptr timer_work_item;
-            {
-                auto grab{ac::acquire_resource_shared(lock_)};
-                if (group_) {
-                    timer_work_item = group_->schedule(
-                        std::forward<C>(callback), due_time, window_length);
-                }
-            }
-            return timer_work_item;
-        }
-
-        template<typename C>
-        [[nodiscard]] bool try_schedule(timer_work_item_ptr &timer_work_item,
-                                        time_point const &due_time,
-                                        DWORD window_length = 0,
-                                        optional_callback_parameters const *params = nullptr) {
-            auto grab{ac::acquire_resource_shared(lock_)};
-            if (group_) {
-                timer_work_item->schedule(due_time, window_length, params);
-                return true;
-            }
-            return false;
-        }
-
-        template<typename C>
-        [[nodiscard]] timer_work_item_ptr try_schedule(C &&callback,
-                                                       duration const &due_time,
-                                                       DWORD window_length = 0,
-                                                       optional_callback_parameters const *params = nullptr) {
-            timer_work_item_ptr timer_work_item;
-            {
-                auto grab{ac::acquire_resource_shared(lock_)};
-                if (group_) {
-                    timer_work_item = group_->schedule(
-                        std::forward<C>(callback), due_time, window_length);
-                }
-            }
-            return timer_work_item;
-        }
-
-        template<typename C>
-        [[nodiscard]] bool try_schedule(timer_work_item_ptr &timer_work_item,
-                                        duration const &due_time,
-                                        DWORD window_length = 0,
-                                        optional_callback_parameters const *params = nullptr) {
-            auto grab{ac::acquire_resource_shared(lock_)};
-            if (group_) {
-                timer_work_item->schedule(due_time, window_length, params);
-                return true;
-            }
-            return false;
-        }
-
-        template<typename C>
-        [[nodiscard]] wait_work_item_ptr try_schedule_wait(
-            C &&callback,
-            HANDLE handle,
-            duration const &due_time = infinite_duration,
-            optional_callback_parameters const *params = nullptr) {
-            wait_work_item_ptr wait_work_item;
-            auto grab{ac::acquire_resource_shared(lock_)};
-            {
-                if (group_) {
-                    wait_work_item = group_->schedule_wait(
-                        std::forward<C>(callback), handle, due_time);
-                }
-            }
-            return wait_work_item;
-        }
-
-        template<typename C>
-        [[nodiscard]] bool try_schedule_wait(wait_work_item_ptr &wait_work_item,
-                                             HANDLE handle,
-                                             duration const &due_time = infinite_duration,
-                                             optional_callback_parameters const *params = nullptr) {
-            auto grab{ac::acquire_resource_shared(lock_)};
-            if (group_) {
-                wait_work_item->schedule_wait(handle, due_time, params);
-                return true;
-            }
-            return false;
-        }
-
-        template<typename C>
-        [[nodiscard]] wait_work_item_ptr try_schedule_wait(
-            C &&callback,
-            HANDLE handle,
-            time_point const &due_time,
-            optional_callback_parameters const *params = nullptr) {
-            wait_work_item_ptr wait_work_item;
-            auto grab{ac::acquire_resource_shared(lock_)};
-            {
-                if (group_) {
-                    wait_work_item = group_->schedule_wait(
-                        std::forward<C>(callback), handle, due_time);
-                }
-            }
-            return wait_work_item;
-        }
-
-        template<typename C>
-        [[nodiscard]] bool try_schedule_wait(wait_work_item_ptr &wait_work_item,
-                                             HANDLE handle,
-                                             time_point const &due_time,
-                                             optional_callback_parameters const *params = nullptr) {
-            auto grab{ac::acquire_resource_shared(lock_)};
-            if (group_) {
-                wait_work_item->schedule_wait(handle, due_time, params);
-                return true;
-            }
-            return false;
-        }
-
-        [[nodiscard]] io_guard try_start_io(io_handler_ptr &io_handler) noexcept {
-            auto grab{ac::acquire_resource_shared(lock_)};
-            if (group_) {
-                return io_handler->start_io();
-            }
-            return io_guard{};
-        }
-
-        resource_owner<rw_lock, rw_lock::acqiure_shared_traits_t> try_acquire() noexcept {
-            auto grab{ac::acquire_resource_shared(lock_)};
-            if (!group_) {
-                grab.release();
-            }
-            return grab;
-        }
-
-    private:
-        mutable ac::rw_lock lock_;
-        cleanup_group_ptr group_;
-    };
-
     inline [[nodiscard]] thread_pool_ptr make_thread_pool(
         unsigned long max_threads = ULONG_MAX,
         unsigned long min_threads = ULONG_MAX,
         PTP_POOL_STACK_INFORMATION stack_information = nullptr) {
         return thread_pool::make(max_threads, min_threads, stack_information);
-    }
-
-    inline cleanup_group_ptr thread_pool::make_cleanup_group() {
-        return cleanup_group::make(shared_from_this());
-    }
-
-    inline [[nodiscard]] cleanup_group_ptr make_cleanup_group() {
-        return cleanup_group::make();
     }
 
     template<typename C>

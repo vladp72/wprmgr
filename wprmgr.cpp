@@ -2,7 +2,6 @@
 //
 
 #include "test\ac_test_thread_pool.h"
-#include "test\ac_test_cancelation_group.h"
 
 #include <memory>
 #include <atomic>
@@ -18,7 +17,7 @@ int main() {
     //test_default_tp_wait_work_item();
     //test_default_tp_io_handler();
 
-    //test_tp_submit_work();
+    test_tp_submit_work();
     //test_tp_post();
     //test_tp_timer_work_item();
     //test_tp_wait_work_item();
@@ -27,7 +26,7 @@ int main() {
     //test_default_thread_pool_cancelation_group();
     //test_thread_pool_cancelation_group();
 
-    stresstest_default_thread_pool_cancelation_group();
+    //stresstest_default_thread_pool_cancelation_group();
     //stresstest_thread_pool_cancelation_group();
 
     return 0;
